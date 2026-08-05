@@ -1,5 +1,6 @@
 {
     "yaml.schemas": {
-        "./pkg/octosts/octosts.TrustPolicy.json": "/.github/chainguard/*"
+        "./pkg/octosts/octosts.TrustPolicy.json": "/.github/chainguard/*.sts.yaml",
+        "./pkg/octosts/octosts.OrgTrustedIssuers.json": "/.github/chainguard/trusted-token-issuers.yaml"
     }
 }
