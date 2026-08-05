@@ -392,6 +392,60 @@ func (s *sts) scanInstalls(ctx context.Context, owner string, installs []ghinsta
 	return orgIssuerEntry{}, false
 }
 
+// installsNotIn returns the installations in installs whose IDs are absent from
+// alreadyScanned. Matching is by ID, not transport pointer: GetAllFresh can return
+// a fresh *AppsTransport for an already-scanned installation. May return nil, so
+// callers test len().
+func installsNotIn(installs, alreadyScanned []ghinstall.Installation) []ghinstall.Installation {
+	seen := make(map[int64]struct{}, len(alreadyScanned))
+	for _, in := range alreadyScanned {
+		seen[in.ID] = struct{}{}
+	}
+	var out []ghinstall.Installation
+	for _, in := range installs {
+		if _, ok := seen[in.ID]; !ok {
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+// confirmNoAccess re-enumerates without the negative cache and returns the entry
+// the confirmation EARNED, or ok=false when it earned nothing, leaving the caller
+// on the stale / fail-closed path. The entry may be Present or Invalid, not only
+// Absent.
+//
+// GetAll can silently omit a just-installed App (it maps a negative-cache NotFound
+// to (nil, nil)), and allow-all is the one conclusion a missing App flips — so
+// without this, installing an App to turn enforcement ON would turn it off.
+//
+// It narrows OUR window, not GitHub's: GetAllFresh bypasses this service's cache
+// but cannot surface an installation GitHub has not yet replicated. That residual
+// is accepted; closing it would fail closed for every single-App org that
+// legitimately cannot read .github.
+func (s *sts) confirmNoAccess(ctx context.Context, owner string, scanned []ghinstall.Installation, t *orgIssuerTally) (orgIssuerEntry, bool) {
+	// Bounded only on success: a confirm that earns nothing is deliberately not
+	// cached and repeats, which is how an org recovers once the API is healthy.
+	fresh, err := s.rrm.GetAllFresh(ctx, owner)
+	if err != nil {
+		clog.WarnContextf(ctx, "confirming the installation set for %s failed: %v", owner, err)
+		return orgIssuerEntry{}, false
+	}
+
+	if entry, definitive := s.scanInstalls(ctx, owner, installsNotIn(fresh, scanned), t); definitive {
+		return entry, true
+	}
+
+	// Re-check rather than reuse the earlier verdict: the newly-found installations
+	// may have added a failure, which is fatal to the conclusion.
+	if t.exhaustiveNoAccess() {
+		clog.WarnContextf(ctx, "no installation can read %s/.github (re-enumerated without the installation cache); org issuer enforcement not applied", owner)
+		return absentOrgIssuerEntry(), true
+	}
+
+	return orgIssuerEntry{}, false
+}
+
 // orgIssuerLookup returns the effective allowlist entry for owner, enumerating
 // EVERY installation and stopping at the first definitive answer. Not s.rrm.Get:
 // pickByQuota is argmax(remaining) with no rotation, so a Get-based loop could see
@@ -414,10 +468,9 @@ func (s *sts) orgIssuerLookup(ctx context.Context, owner string) (orgIssuerEntry
 	// Absent requires POSITIVE knowledge: a failed or partial enumeration is not
 	// evidence of absence and is never cached. See exhaustiveNoAccess.
 	if enumErr == nil && t.exhaustiveNoAccess() {
-		clog.WarnContextf(ctx, "no installation can read %s/.github; org issuer enforcement not applied", owner)
-		absent := absentOrgIssuerEntry()
-		cacheOrgIssuerEntry(ctx, owner, absent)
-		return absent, nil
+		if entry, ok := s.confirmNoAccess(ctx, owner, installs, &t); ok {
+			return s.settleOrgIssuerEntry(ctx, owner, entry), nil
+		}
 	}
 
 	// Not exhaustive, or something failed. Serving stale is inherently mode-aware:
