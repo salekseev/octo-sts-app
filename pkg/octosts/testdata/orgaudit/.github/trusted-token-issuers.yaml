@@ -1,0 +1,3 @@
+mode: audit
+issuers:
+  - https://some-other-idp.example.com
